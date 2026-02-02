@@ -12,6 +12,8 @@ class CacheMetadataStore {
   static final Map<String, CacheMetadata> _cache = {};
   static bool _loaded = false;
   static String? _metadataPath;
+  static final Map<String, DateTime> _lastPersisted = {};
+  static const Duration _persistInterval = Duration(seconds: 5);
 
   /// Load metadata from disk.
   static Future<void> _ensureLoaded() async {
@@ -31,6 +33,8 @@ class CacheMetadataStore {
     } catch (_) {
       // Ignore corrupt metadata
     }
+
+    await _reconcileWithFiles();
   }
 
   static Future<String> _getMetadataPath() async {
@@ -79,8 +83,13 @@ class CacheMetadataStore {
       isHls: isHls,
     );
 
-    // Persist only on completion to reduce I/O
-    if (isComplete) {
+    // Persist on completion or periodically to reduce I/O
+    final now = DateTime.now();
+    final lastPersisted = _lastPersisted[url];
+    if (isComplete ||
+        lastPersisted == null ||
+        now.difference(lastPersisted) >= _persistInterval) {
+      _lastPersisted[url] = now;
       await _persist();
     }
   }
@@ -165,10 +174,58 @@ class CacheMetadataStore {
   /// Clear all metadata.
   static Future<void> clearAll() async {
     _cache.clear();
+    _lastPersisted.clear();
     final path = await _getMetadataPath();
     final file = File(path);
     if (file.existsSync()) {
       await file.delete();
+    }
+  }
+
+  static Future<void> _reconcileWithFiles() async {
+    if (_cache.isEmpty) return;
+
+    final tempDir = await getTemporaryDirectory();
+    final cacheDir = '${tempDir.path}/video_cache';
+
+    final urlsToRemove = <String>[];
+    for (final entry in _cache.entries) {
+      final url = entry.key;
+      final meta = entry.value;
+
+      if (meta.isHls) {
+        continue;
+      }
+
+      final hash = _urlToHash(url);
+      final filePath = '$cacheDir/$hash.mp4';
+      final file = File(filePath);
+
+      if (!file.existsSync()) {
+        urlsToRemove.add(url);
+        continue;
+      }
+
+      final size = file.lengthSync();
+      final totalBytes = meta.totalBytes;
+      final isComplete =
+          totalBytes != null ? size >= totalBytes : meta.isComplete;
+
+      if (size != meta.downloadedBytes || isComplete != meta.isComplete) {
+        _cache[url] = CacheMetadata(
+          downloadedBytes: size,
+          totalBytes: totalBytes,
+          isComplete: isComplete,
+          lastUpdated: DateTime.now(),
+          isHls: meta.isHls,
+        );
+      }
+    }
+
+    if (urlsToRemove.isNotEmpty) {
+      for (final url in urlsToRemove) {
+        _cache.remove(url);
+      }
     }
   }
 }

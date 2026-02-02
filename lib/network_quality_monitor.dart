@@ -1,6 +1,6 @@
 import 'package:flutter/foundation.dart';
 
-import 'reel_prefetch_controller.dart';
+import 'network_types.dart';
 
 /// Monitors network quality and estimates bandwidth.
 /// Provides adaptive prefetch configuration based on detected network conditions.

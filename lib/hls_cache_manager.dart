@@ -80,13 +80,24 @@ class HlsCacheManager {
     final hlsCacheDir = await _getHlsCacheDir(originalUrl);
     await Directory(hlsCacheDir).create(recursive: true);
 
+    final initialState = await _computeInitialCacheState(
+      hlsCacheDir,
+      playlist,
+    );
+
     // Save playlist metadata
-    await _savePlaylistMetadata(originalUrl, playlist);
+    await _savePlaylistMetadata(
+      originalUrl,
+      playlist,
+      cachedSegments: initialState.cachedSegments,
+    );
 
     // Start downloading first N segments
     _startSegmentDownloads(
       originalUrl,
       playlist,
+      initialState.nextIndex,
+      initialState.cachedSegments,
       prefetchSegments,
       headers,
     );
@@ -99,9 +110,9 @@ class HlsCacheManager {
 
     return HlsCacheResult(
       playlistPath: localPlaylistPath,
-      isFullyCached: false,
+      isFullyCached: initialState.cachedSegments >= playlist.segments.length,
       totalSegments: playlist.segments.length,
-      cachedSegments: 0,
+      cachedSegments: initialState.cachedSegments,
     );
   }
 
@@ -147,6 +158,8 @@ class HlsCacheManager {
   static void _startSegmentDownloads(
     String originalUrl,
     HlsMediaPlaylist playlist,
+    int nextIndex,
+    int cachedSegments,
     int prefetchCount,
     Map<String, String>? headers,
   ) {
@@ -156,6 +169,8 @@ class HlsCacheManager {
       originalUrl: originalUrl,
       playlist: playlist,
       headers: headers,
+      nextIndex: nextIndex,
+      cachedSegments: cachedSegments,
     );
     _downloads[originalUrl] = state;
 
@@ -167,45 +182,67 @@ class HlsCacheManager {
     _HlsDownloadState state,
     int count,
   ) async {
-    if (state.cancelled) return;
+    if (state.cancelled || state.isDownloading) return;
 
-    final hlsCacheDir = await _getHlsCacheDir(state.originalUrl);
-    int downloaded = 0;
+    state.isDownloading = true;
+    try {
+      final hlsCacheDir = await _getHlsCacheDir(state.originalUrl);
+      var requested = count;
 
-    for (final segment in state.playlist.segments) {
-      if (state.cancelled) break;
-      if (downloaded >= count) break;
+      while (!state.cancelled) {
+        int downloaded = 0;
 
-      final segmentPath = _getSegmentPath(hlsCacheDir, segment.index);
-      final segmentFile = File(segmentPath);
+        while (state.nextIndex < state.playlist.segments.length &&
+            downloaded < requested &&
+            !state.cancelled) {
+          final segment = state.playlist.segments[state.nextIndex];
+          final segmentPath = _getSegmentPath(hlsCacheDir, segment.index);
+          final segmentFile = File(segmentPath);
 
-      // Skip if already cached
-      if (await segmentFile.exists() && await segmentFile.length() > 0) {
-        continue;
+          // Skip if already cached
+          if (await segmentFile.exists() && await segmentFile.length() > 0) {
+            state.nextIndex++;
+            continue;
+          }
+
+          try {
+            await _downloadSegment(
+              segment.url,
+              segmentPath,
+              state.headers,
+            );
+            downloaded++;
+            state.cachedSegments++;
+
+            await _updateCacheProgress(
+              state.originalUrl,
+              state.cachedSegments,
+              state.playlist.segments.length,
+            );
+
+            await _generateLocalPlaylist(state.originalUrl, state.playlist);
+          } catch (e) {
+            // Continue with next segment on error
+          }
+
+          state.nextIndex++;
+        }
+
+        if (state.nextIndex >= state.playlist.segments.length) {
+          if (!state.playlist.isLive) {
+            await _markHlsComplete(state);
+            _downloads.remove(state.originalUrl);
+            return;
+          }
+
+          _scheduleLiveRefresh(state);
+          return;
+        }
+
+        requested = 2;
       }
-
-      // Download segment
-      try {
-        await _downloadSegment(
-          segment.url,
-          segmentPath,
-          state.headers,
-        );
-        downloaded++;
-
-        // Update metadata
-        await _updateCacheProgress(state.originalUrl, segment.index);
-
-        // Regenerate local playlist with new cached segment
-        await _generateLocalPlaylist(state.originalUrl, state.playlist);
-      } catch (e) {
-        // Continue with next segment on error
-      }
-    }
-
-    // Continue downloading remaining segments
-    if (!state.cancelled) {
-      _downloadNextSegments(state, 2); // Download 2 more at a time
+    } finally {
+      state.isDownloading = false;
     }
   }
 
@@ -301,27 +338,115 @@ class HlsCacheManager {
   /// Save playlist metadata.
   static Future<void> _savePlaylistMetadata(
     String url,
-    HlsMediaPlaylist playlist,
-  ) async {
+    HlsMediaPlaylist playlist, {
+    required int cachedSegments,
+  }) async {
     await CacheMetadataStore.updateProgress(
       url,
-      downloadedBytes: 0,
+      downloadedBytes: cachedSegments,
       totalBytes: playlist.segments.length,
       isHls: true,
     );
   }
 
   /// Update cache progress for HLS.
-  static Future<void> _updateCacheProgress(String url, int segmentIndex) async {
+  static Future<void> _updateCacheProgress(
+    String url,
+    int cachedSegments,
+    int totalSegments,
+  ) async {
     final meta = await CacheMetadataStore.get(url);
     if (meta != null) {
       await CacheMetadataStore.updateProgress(
         url,
-        downloadedBytes: segmentIndex + 1,
-        totalBytes: meta.totalBytes,
+        downloadedBytes: cachedSegments,
+        totalBytes: totalSegments,
         isHls: true,
       );
     }
+  }
+
+  static Future<void> _markHlsComplete(_HlsDownloadState state) async {
+    await CacheMetadataStore.updateProgress(
+      state.originalUrl,
+      downloadedBytes: state.playlist.segments.length,
+      totalBytes: state.playlist.segments.length,
+      isHls: true,
+    );
+    state.refreshTimer?.cancel();
+  }
+
+  static void _scheduleLiveRefresh(_HlsDownloadState state) {
+    if (state.cancelled) return;
+    if (state.refreshTimer?.isActive ?? false) return;
+
+    final baseDelay = state.playlist.targetDuration.ceil().clamp(3, 30);
+    final delaySeconds =
+        state.refreshBackoffSeconds > 0 ? state.refreshBackoffSeconds : baseDelay;
+
+    state.refreshTimer = Timer(Duration(seconds: delaySeconds), () async {
+      await _refreshLivePlaylist(state);
+    });
+  }
+
+  static Future<void> _refreshLivePlaylist(_HlsDownloadState state) async {
+    if (state.cancelled) return;
+
+    try {
+      final refreshed =
+          await _fetchAndParsePlaylist(state.playlist.url, state.headers);
+      if (refreshed is! HlsMediaPlaylist) return;
+
+      state.playlist = refreshed;
+      state.refreshBackoffSeconds = 0;
+
+      final hlsCacheDir = await _getHlsCacheDir(state.originalUrl);
+      final initialState = await _computeInitialCacheState(
+        hlsCacheDir,
+        refreshed,
+      );
+      state.nextIndex = initialState.nextIndex;
+      state.cachedSegments = initialState.cachedSegments;
+
+      await _savePlaylistMetadata(
+        state.originalUrl,
+        refreshed,
+        cachedSegments: state.cachedSegments,
+      );
+
+      _downloadNextSegments(state, 2);
+    } catch (_) {
+      final nextBackoff = state.refreshBackoffSeconds == 0
+          ? state.playlist.targetDuration.ceil().clamp(3, 30)
+          : (state.refreshBackoffSeconds * 2).clamp(3, 60);
+      state.refreshBackoffSeconds = nextBackoff;
+      _scheduleLiveRefresh(state);
+    }
+  }
+
+  static Future<_InitialCacheState> _computeInitialCacheState(
+    String hlsCacheDir,
+    HlsMediaPlaylist playlist,
+  ) async {
+    int cachedSegments = 0;
+    int? firstMissingIndex;
+
+    for (int i = 0; i < playlist.segments.length; i++) {
+      final segment = playlist.segments[i];
+      final segmentPath = _getSegmentPath(hlsCacheDir, segment.index);
+      final segmentFile = File(segmentPath);
+
+      if (await segmentFile.exists() && await segmentFile.length() > 0) {
+        cachedSegments++;
+      } else {
+        firstMissingIndex ??= i;
+      }
+    }
+
+    return _InitialCacheState(
+      nextIndex: firstMissingIndex ?? playlist.segments.length,
+      cachedSegments: cachedSegments,
+    );
   }
 
   /// Cancel HLS download.
@@ -329,6 +454,7 @@ class HlsCacheManager {
     final state = _downloads[url];
     if (state != null) {
       state.cancelled = true;
+      state.refreshTimer?.cancel();
       _downloads.remove(url);
     }
   }
@@ -355,14 +481,23 @@ class HlsCacheManager {
 /// State for tracking HLS downloads.
 class _HlsDownloadState {
   final String originalUrl;
-  final HlsMediaPlaylist playlist;
+  HlsMediaPlaylist playlist;
   final Map<String, String>? headers;
+  int nextIndex;
+  int cachedSegments;
+  bool isDownloading;
+  Timer? refreshTimer;
+  int refreshBackoffSeconds;
   bool cancelled = false;
 
   _HlsDownloadState({
     required this.originalUrl,
     required this.playlist,
     this.headers,
+    this.nextIndex = 0,
+    this.cachedSegments = 0,
+    this.isDownloading = false,
+    this.refreshBackoffSeconds = 0,
   });
 }
 
@@ -384,4 +519,14 @@ class HlsCacheResult {
     if (totalSegments == null || totalSegments == 0) return 0.0;
     return (cachedSegments ?? 0) / totalSegments!;
   }
+}
+
+class _InitialCacheState {
+  final int nextIndex;
+  final int cachedSegments;
+
+  _InitialCacheState({
+    required this.nextIndex,
+    required this.cachedSegments,
+  });
 }

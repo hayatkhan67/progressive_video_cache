@@ -140,6 +140,12 @@ class ProgressiveDownloader {
     final state = _downloads[url];
     if (state != null) {
       state.cancelled = true;
+      state.subscription?.cancel();
+      state.request?.abort();
+      state.sink?.close();
+      if (state.completer != null && !state.completer!.isCompleted) {
+        state.completer!.complete();
+      }
       _downloads.remove(url);
     }
   }
@@ -166,20 +172,37 @@ class ProgressiveDownloader {
     try {
       // Use pooled client for connection reuse
       final client = _nextClient;
+      final uri = Uri.parse(url);
 
-      final request = await client.getUrl(Uri.parse(url));
+      Future<HttpClientResponse> sendRequest(int rangeStart) async {
+        final request = await client.getUrl(uri);
+        state.request = request;
 
-      // Add range header for resume
-      if (startByte > 0) {
-        request.headers.set('Range', 'bytes=$startByte-');
+        // Add range header for resume
+        if (rangeStart > 0) {
+          request.headers.set('Range', 'bytes=$rangeStart-');
+        }
+
+        // Add custom headers
+        headers?.forEach((key, value) {
+          request.headers.set(key, value);
+        });
+
+        return request.close();
       }
 
-      // Add custom headers
-      headers?.forEach((key, value) {
-        request.headers.set(key, value);
-      });
+      var effectiveStart = startByte;
+      var response = await sendRequest(effectiveStart);
+      state.response = response;
 
-      final response = await request.close();
+      // If server ignored Range, restart from 0 to avoid corruption
+      if (effectiveStart > 0 && response.statusCode == 200) {
+        await response.drain();
+        await _truncateFile(filePath);
+        effectiveStart = 0;
+        response = await sendRequest(effectiveStart);
+        state.response = response;
+      }
 
       // Check for valid response
       if (response.statusCode != 200 && response.statusCode != 206) {
@@ -189,31 +212,53 @@ class ProgressiveDownloader {
       // Determine total size
       int? totalBytes;
       if (response.contentLength > 0) {
-        totalBytes = startByte + response.contentLength;
+        totalBytes = effectiveStart + response.contentLength;
       }
 
       // Open file for append
       final file = File(filePath);
-      final sink = file.openWrite(mode: FileMode.writeOnlyAppend);
+      final mode =
+          effectiveStart > 0 ? FileMode.writeOnlyAppend : FileMode.write;
+      final sink = file.openWrite(mode: mode);
+      state.sink = sink;
 
-      int downloadedBytes = startByte;
-      int lastReportedBytes = startByte;
+      int downloadedBytes = effectiveStart;
+      int lastReportedBytes = effectiveStart;
 
-      await for (final chunk in response) {
-        if (state.cancelled) {
+      final done = Completer<void>();
+      state.completer = done;
+      state.subscription = response.listen(
+        (chunk) {
+          if (state.cancelled) return;
+          sink.add(chunk);
+          downloadedBytes += chunk.length;
+
+          // Throttle progress updates using chunkSize
+          if (downloadedBytes - lastReportedBytes >= chunkSize) {
+            onProgress(downloadedBytes, totalBytes);
+            lastReportedBytes = downloadedBytes;
+          }
+        },
+        onError: (e) {
+          if (!done.isCompleted) {
+            done.completeError(e);
+          }
+        },
+        onDone: () {
+          if (!done.isCompleted) {
+            done.complete();
+          }
+        },
+        cancelOnError: true,
+      );
+
+      await done.future;
+
+      if (state.cancelled) {
+        try {
           await sink.close();
-          // Don't close pooled client - let it be reused
-          return;
-        }
-
-        sink.add(chunk);
-        downloadedBytes += chunk.length;
-
-        // Throttle progress updates using chunkSize
-        if (downloadedBytes - lastReportedBytes >= chunkSize) {
-          onProgress(downloadedBytes, totalBytes);
-          lastReportedBytes = downloadedBytes;
-        }
+        } catch (_) {}
+        return;
       }
 
       await sink.flush();
@@ -230,6 +275,11 @@ class ProgressiveDownloader {
 
 class _DownloadState {
   bool cancelled = false;
+  HttpClientRequest? request;
+  HttpClientResponse? response;
+  StreamSubscription<List<int>>? subscription;
+  IOSink? sink;
+  Completer<void>? completer;
 }
 
 /// Progress update from downloader.
@@ -263,4 +313,13 @@ class DownloadResult {
     required this.isComplete,
     this.subscription,
   });
+}
+
+Future<void> _truncateFile(String filePath) async {
+  final file = File(filePath);
+  if (await file.exists()) {
+    await file.writeAsBytes(const [], mode: FileMode.write);
+  } else {
+    await file.create(recursive: true);
+  }
 }

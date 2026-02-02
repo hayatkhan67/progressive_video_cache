@@ -128,4 +128,52 @@ https://cdn.example.com/full/url/segment.ts
       expect(controller.maxConcurrent, equals(5));
     });
   });
+
+  group('NetworkQualityMonitor', () {
+    test('updateFromConnectivity sets network type', () {
+      final monitor = NetworkQualityMonitor.instance;
+      monitor.reset();
+
+      monitor.updateFromConnectivity(isWifi: true);
+      expect(monitor.currentType, equals(NetworkType.wifi));
+
+      monitor.updateFromConnectivity(isMobile: true);
+      expect(monitor.currentType, equals(NetworkType.fourG));
+
+      monitor.updateFromConnectivity(isWifi: null, isMobile: null);
+      expect(monitor.currentType, equals(NetworkType.offline));
+    });
+
+    test('recordBandwidthSample updates network type on mobile', () {
+      final monitor = NetworkQualityMonitor.instance;
+      monitor.reset();
+      monitor.updateFromConnectivity(isMobile: true);
+      monitor.recordBandwidthSample(3 * 1024 * 1024, const Duration(seconds: 1));
+      expect(monitor.currentType, equals(NetworkType.fiveG));
+
+      monitor.reset();
+      monitor.updateFromConnectivity(isMobile: true);
+      monitor.recordBandwidthSample(700 * 1024, const Duration(seconds: 1));
+      expect(monitor.currentType, equals(NetworkType.fourG));
+
+      monitor.reset();
+      monitor.updateFromConnectivity(isMobile: true);
+      monitor.recordBandwidthSample(100 * 1024, const Duration(seconds: 1));
+      expect(monitor.currentType, equals(NetworkType.slow));
+    });
+  });
+
+  group('PrefetchConfig', () {
+    test('forNetwork returns expected defaults', () {
+      expect(PrefetchConfig.forNetwork(NetworkType.wifi).prefetchAhead, equals(4));
+      expect(
+        PrefetchConfig.forNetwork(NetworkType.fourG).maxConcurrent,
+        equals(2),
+      );
+      expect(
+        PrefetchConfig.forNetwork(NetworkType.offline).prefetchAhead,
+        equals(0),
+      );
+    });
+  });
 }
