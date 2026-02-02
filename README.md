@@ -2,29 +2,41 @@
 
 [![pub package](https://img.shields.io/pub/v/progressive_video_cache.svg)](https://pub.dev/packages/progressive_video_cache)
 
-Progressive video caching for Flutter Reels/short-video apps.
+Progressive video caching for Flutter Reels/short-video apps. Supports both MP4 and HLS (.m3u8) streams with adaptive network-aware prefetching.
 
 ## Features
 
-- **Progressive playback**: Play videos before download completes
-- **Offline-first**: Cached bytes play instantly without network
-- **Resume downloads**: Continue from last downloaded byte
-- **Scroll-aware prefetch**: Automatically cache upcoming videos
-- **Simple API**: 4 classes, zero configuration
+- **Progressive playback**: Play videos before download completes.
+- **HLS Support**: Automatic parsing and segment-based caching of M3U8 playlists.
+- **Adaptive Prefetching**: Automatically adjusts prefetch counts based on network quality (WiFi, 5G, 4G, Slow).
+- **Offline-first**: Cached bytes/segments play instantly without network.
+- **Resume downloads**: Continue from last downloaded byte.
+- **Scroll-aware prefetch**: Automatically manage download lifecycle during scrolling.
+- **Network Monitoring**: Built-in bandwidth estimation for intelligent caching decisions.
 
 ## Architecture
 
+### MP4 Caching
 ```
 VideoPlayerController.file()
         ↓
 Growing local file (append-only)
         ↑
-ProgressiveDownloader (HTTP stream → file)
+ProgressiveDownloader (HTTP range request → file)
 ```
 
-No proxy servers. No sockets. No complex state machines.
+### HLS Caching
+```
+VideoPlayerController.file()
+        ↓
+Local .m3u8 playlist (points to local .ts files)
+        ↑
+HlsCacheManager (Downloads segments progressively)
+```
 
 ## Usage
+
+### Simple Usage
 
 ```dart
 import 'dart:io';
@@ -32,120 +44,84 @@ import 'package:progressive_video_cache/progressive_video_cache.dart';
 import 'package:video_player/video_player.dart';
 
 // Create prefetch controller
-final prefetch = ReelPrefetchController(maxConcurrent: 2);
+final prefetch = ReelPrefetchController();
 
-// Get playable path (starts download if needed)
+// Get playable path (works for both MP4 and HLS)
 final path = await prefetch.getPlayablePath(videoUrl);
 
-// Play from file
+// Play from path
 final controller = VideoPlayerController.file(File(path));
 await controller.initialize();
 controller.play();
+```
 
-// On scroll, prefetch next videos
+### Adaptive Scrolling
+
+Pass your list of URLs and current index to `onScrollUpdate`. The controller will use the `NetworkQualityMonitor` to decide how many videos to prefetch ahead and behind.
+
+```dart
 prefetch.onScrollUpdate(
   urls: allVideoUrls,
   currentIndex: currentIndex,
 );
+```
 
-// Cleanup
-prefetch.dispose();
+### Network Quality Monitoring
+
+The package automatically monitors network quality. You can manually hint at connectivity changes:
+
+```dart
+final monitor = NetworkQualityMonitor.instance;
+
+// Update from connectivity_plus or similar
+monitor.updateFromConnectivity(isWifi: true);
+
+// Record custom bandwidth sample if needed
+monitor.recordBandwidthSample(bytesDownloaded, duration);
 ```
 
 ## API
 
 ### ReelPrefetchController
 
-Main entry point for video caching.
+Main entry point.
+
+- `Future<String> getPlayablePath(String url)`: Gets path for playback. Detects HLS automatically.
+- `void onScrollUpdate({required List<String> urls, required int currentIndex})`: Manages prefetch based on scroll position.
+- `void setNetworkType(NetworkType? type)`: Manually override the network type (e.g., force 'Slow' mode).
+
+### NetworkQualityMonitor
+
+Singleton for bandwidth estimation.
+
+- `double get estimatedBandwidth`: Get current estimation in KB/s.
+- `NetworkType get currentType`: Get detected network type (wifi, fiveG, fourG, slow).
+- `PrefetchConfig get prefetchConfig`: Get recommended config for current network.
+
+### PrefetchConfig
+
+Immutable configuration for prefetching behavior.
 
 ```dart
-// Create controller
-final prefetch = ReelPrefetchController(maxConcurrent: 2);
-
-// Get path for playback (starts download if not cached)
-Future<String> getPlayablePath(String url);
-
-// Check if fully cached
-Future<bool> isCached(String url);
-
-// Cancel active download
-void cancelDownload(String url);
-
-// Update prefetch on scroll
-void onScrollUpdate({
-  required List<String> urls,
-  required int currentIndex,
-  int prefetchCount = 2,
-  int keepRange = 3,
-});
-
-// Cleanup
-void dispose();
-```
-
-### CacheFileManager
-
-Direct file operations.
-
-```dart
-// Get cache path for URL
-Future<String> getFilePath(String url);
-
-// Check if file exists
-Future<bool> exists(String url);
-
-// Get current file size
-Future<int> getFileSize(String url);
-
-// Delete cached file
-Future<void> delete(String url);
-
-// Clear all cache
-Future<void> clearAll();
-```
-
-### CacheMetadataStore
-
-Download progress tracking.
-
-```dart
-// Check if complete
-Future<bool> isComplete(String url);
-
-// Get downloaded bytes
-Future<int> getDownloadedBytes(String url);
-
-// Get metadata
-Future<CacheMetadata?> get(String url);
-```
-
-### ProgressiveDownloader
-
-Low-level download API (usually not needed directly).
-
-```dart
-// Start download, returns progress stream
-static Stream<DownloadProgress> download({
-  required String url,
-  required String filePath,
-  int startByte = 0,
-});
-
-// Cancel download
-static void cancel(String url);
+final config = PrefetchConfig(
+  prefetchAhead: 3,
+  prefetchBehind: 1,
+  keepRange: 5,
+  maxConcurrent: 3,
+);
 ```
 
 ## Platform Notes
 
-- **Android**: ExoPlayer supports growing files
-- **iOS**: AVPlayer supports growing files
-- **Format**: MP4 only (no HLS parsing)
+- **MP4**: Works on Android and iOS using standard file-based playback for growing files.
+- **HLS**: Works by generating a local `.m3u8` playlist that points to cached `.ts` segments.
+- **Storage**: Files are stored in the application cache directory by default.
 
 ## Installation
 
 ```yaml
 dependencies:
-  progressive_video_cache: ^1.0.0
+  progressive_video_cache: ">=1.0.0 <2.0.0"
 ```
 
 ## License
