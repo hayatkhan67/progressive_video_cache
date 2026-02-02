@@ -1,129 +1,98 @@
-# progressive_video_cache
+<div align="center">
+
+<img src="assets/logo.png" height="150" alt="progressive_video_cache logo" />
+
+# Progressive Video Cache
 
 [![pub package](https://img.shields.io/pub/v/progressive_video_cache.svg)](https://pub.dev/packages/progressive_video_cache)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Progressive video caching for Flutter Reels/short-video apps. Supports both MP4 and HLS (.m3u8) streams with adaptive network-aware prefetching.
+**The ultimate caching solution for TikTok-style scrolling apps.**
 
-## Features
+</div>
 
-- **Progressive playback**: Play videos before download completes.
-- **HLS Support**: Automatic parsing and segment-based caching of M3U8 playlists.
-- **Adaptive Prefetching**: Automatically adjusts prefetch counts based on network quality (WiFi, 5G, 4G, Slow).
-- **Offline-first**: Cached bytes/segments play instantly without network.
-- **Resume downloads**: Continue from last downloaded byte.
-- **Scroll-aware prefetch**: Automatically manage download lifecycle during scrolling.
-- **Network Monitoring**: Built-in bandwidth estimation for intelligent caching decisions.
+---
 
-## Architecture
+**progressive_video_cache** is a high-performance video caching library designed specifically for Flutter apps that need instant playback, offline support, and smart network management. 
 
-### MP4 Caching
-```
-VideoPlayerController.file()
-        ↓
-Growing local file (append-only)
-        ↑
-ProgressiveDownloader (HTTP range request → file)
-```
+It handles both standard **MP4** files and complex **HLS (.m3u8)** streams with adaptive prefetching, making it perfect for Reels, Shorts, and Feed-based video applications.
 
-### HLS Caching
-```
-VideoPlayerController.file()
-        ↓
-Local .m3u8 playlist (points to local .ts files)
-        ↑
-HlsCacheManager (Downloads segments progressively)
+## ✨ Features
+
+- ⚡ **Instant Playback**: Stream while downloading (progressive caching).
+- 🎬 **HLS & MP4 Support**: Seamlessly handles both formats with a unified API.
+- 🧠 **Smart Prefetching**: Automatically prefetches upcoming videos in your feed based on scroll direction.
+- 📡 **Network Aware**: Adapts download strategies based on real-time network quality (WiFi, 4G, 5G, Slow).
+- 💾 **Offline First**: Cached content plays instantly without an internet connection.
+- 🔄 **Resumable Downloads**: Downloads pick up exactly where they left off.
+- 📦 **Zero Config**: Works out of the box with reasonable defaults.
+
+## 🚀 Installation
+
+Add this to your `pubspec.yaml`:
+
+```yaml
+dependencies:
+  progressive_video_cache: ^1.0.0
 ```
 
-## Usage
+## 🛠 Usage
 
-### Simple Usage
+### 1. Basic Playback
+Get a file path that is ready to play. The package handles downloading and caching internally.
 
 ```dart
 import 'dart:io';
 import 'package:progressive_video_cache/progressive_video_cache.dart';
 import 'package:video_player/video_player.dart';
 
-// Create prefetch controller
+// Initialize the controller
 final prefetch = ReelPrefetchController();
 
-// Get playable path (works for both MP4 and HLS)
-final path = await prefetch.getPlayablePath(videoUrl);
+// Get the local path (downloads automatically if needed)
+final path = await prefetch.getPlayablePath('https://example.com/video.m3u8');
 
-// Play from path
+// Play using the standard VideoPlayerController
 final controller = VideoPlayerController.file(File(path));
 await controller.initialize();
 controller.play();
 ```
 
-### Adaptive Scrolling
-
-Pass your list of URLs and current index to `onScrollUpdate`. The controller will use the `NetworkQualityMonitor` to decide how many videos to prefetch ahead and behind.
+### 2. Smart Feed Prefetching
+Integrate with your PageView or ListView to automatically prefetch videos before they appear on screen.
 
 ```dart
+// In your PageView.onPageChanged or ScrollController listener
 prefetch.onScrollUpdate(
-  urls: allVideoUrls,
-  currentIndex: currentIndex,
+  urls: videoUrlsList,  // List of all video URLs in the feed
+  currentIndex: index,  // Current visible index
 );
 ```
 
-### Network Quality Monitoring
-
-The package automatically monitors network quality. You can manually hint at connectivity changes:
+### 3. Network Quality Monitoring
+The package includes a singleton to monitor network conditions and optimize bandwidth usage.
 
 ```dart
 final monitor = NetworkQualityMonitor.instance;
 
-// Update from connectivity_plus or similar
-monitor.updateFromConnectivity(isWifi: true);
-
-// Record custom bandwidth sample if needed
-monitor.recordBandwidthSample(bytesDownloaded, duration);
+// Get current network type info
+print('Network speed: ${monitor.estimatedBandwidth} KB/s');
+print('Network type: ${monitor.currentType}'); // NetworkType.wifi, .fourG, etc.
 ```
 
-## API
+## 🏗 Architecture
 
-### ReelPrefetchController
+**progressive_video_cache** uses a unique file-based approach rather than a local proxy:
 
-Main entry point.
+- **MP4**: Downloads directly to a growing local file which the video player reads simultaneously.
+- **HLS**: Downloads the master playlist, parses media playlists, and progressively downloads TS segments to local storage, creating a local playback manifest.
 
-- `Future<String> getPlayablePath(String url)`: Gets path for playback. Detects HLS automatically.
-- `void onScrollUpdate({required List<String> urls, required int currentIndex})`: Manages prefetch based on scroll position.
-- `void setNetworkType(NetworkType? type)`: Manually override the network type (e.g., force 'Slow' mode).
+This architecture ensures high stability and eliminates common proxy-server issues like socket disconnects.
 
-### NetworkQualityMonitor
+## 🤝 Contributing
 
-Singleton for bandwidth estimation.
+Contributions are welcome! Please feel free to submit a Pull Request.
 
-- `double get estimatedBandwidth`: Get current estimation in KB/s.
-- `NetworkType get currentType`: Get detected network type (wifi, fiveG, fourG, slow).
-- `PrefetchConfig get prefetchConfig`: Get recommended config for current network.
+## 📄 License
 
-### PrefetchConfig
-
-Immutable configuration for prefetching behavior.
-
-```dart
-final config = PrefetchConfig(
-  prefetchAhead: 3,
-  prefetchBehind: 1,
-  keepRange: 5,
-  maxConcurrent: 3,
-);
-```
-
-## Platform Notes
-
-- **MP4**: Works on Android and iOS using standard file-based playback for growing files.
-- **HLS**: Works by generating a local `.m3u8` playlist that points to cached `.ts` segments.
-- **Storage**: Files are stored in the application cache directory by default.
-
-## Installation
-
-```yaml
-dependencies:
-  progressive_video_cache: ">=1.0.0 <2.0.0"
-```
-
-## License
-
-MIT
+This project is licensed under the MIT License - see the LICENSE file for details.
