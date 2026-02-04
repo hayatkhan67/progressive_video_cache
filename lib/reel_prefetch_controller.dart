@@ -31,6 +31,7 @@ class ReelPrefetchController {
   final Queue<_DownloadRequest> _lowPriorityQueue = Queue<_DownloadRequest>();
   final Set<String> _inFlight = {};
   final Set<String> _queuedUrls = {};
+  final Set<String> _activeHls = {};
 
   /// Optional manual network type override (null = use NetworkQualityMonitor)
   NetworkType? _networkTypeOverride;
@@ -76,8 +77,14 @@ class ReelPrefetchController {
         prefetchSegments: 3,
         headers: headers,
       );
+      if (result.isFullyCached) {
+        _activeHls.remove(url);
+      } else {
+        _activeHls.add(url);
+      }
       return result.playlistPath;
     } catch (e) {
+      _activeHls.remove(url);
       // Fallback to original URL on error
       return url;
     }
@@ -93,6 +100,7 @@ class ReelPrefetchController {
     // If already complete, return immediately
     final isComplete = await CacheMetadataStore.isComplete(url);
     if (isComplete) {
+      await CacheFileManager.updateAccessTime(url);
       return path;
     }
 
@@ -103,6 +111,7 @@ class ReelPrefetchController {
     if (fileSize >= minBytes) {
       // Enough bytes exist, resume download in background
       _startDownload(url, path, headers);
+      await CacheFileManager.updateAccessTime(url);
       return path;
     }
 
@@ -110,7 +119,9 @@ class ReelPrefetchController {
     // Already downloading?
     if (_activeDownloads.containsKey(url)) {
       // Wait for existing download to reach threshold
-      return await _waitForMinBytes(url, path, minBytes);
+      final result = await _waitForMinBytes(url, path, minBytes);
+      await CacheFileManager.updateAccessTime(url);
+      return result;
     }
 
     // At concurrency limit?
@@ -124,11 +135,14 @@ class ReelPrefetchController {
           priority: _DownloadPriority.high,
         ),
       );
+      await CacheFileManager.updateAccessTime(url);
       return path;
     }
 
     // Start download and wait for minimum bytes
-    return await _downloadAndWaitForMin(url, path, headers);
+    final result = await _downloadAndWaitForMin(url, path, headers);
+    await CacheFileManager.updateAccessTime(url);
+    return result;
   }
 
   /// Check if video is fully cached.
@@ -304,6 +318,7 @@ class ReelPrefetchController {
     if (_inFlight.remove(url)) {
       _processQueue();
     }
+    unawaited(CacheFileManager.evictIfNeededThrottled());
   }
 
   void _enqueueDownload(_DownloadRequest request) {
@@ -370,6 +385,7 @@ class ReelPrefetchController {
     if (HlsParser.isHlsUrl(url)) {
       HlsCacheManager.cancel(url);
     }
+    _activeHls.remove(url);
   }
 
   /// Cancel all downloads.
@@ -382,6 +398,7 @@ class ReelPrefetchController {
     _clearQueue();
     ProgressiveDownloader.cancelAll();
     HlsCacheManager.cancelAll();
+    _activeHls.clear();
   }
 
   /// Update prefetch based on current scroll position.
@@ -413,6 +430,21 @@ class ReelPrefetchController {
     }
     for (final url in urlsToCancel) {
       cancelDownload(url);
+    }
+
+    // Cancel HLS downloads outside keep range
+    final keepUrls = <String>{};
+    for (int i = currentIndex - effectiveKeepRange;
+        i <= currentIndex + effectiveKeepRange;
+        i++) {
+      if (i >= 0 && i < urls.length) {
+        keepUrls.add(urls[i]);
+      }
+    }
+    for (final url in _activeHls.toList()) {
+      if (!keepUrls.contains(url)) {
+        cancelDownload(url);
+      }
     }
 
     // Priority-based prefetch: next video first, then previous, then further ahead

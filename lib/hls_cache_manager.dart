@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:io';
 
 import 'cache_file_manager.dart';
@@ -12,6 +13,9 @@ class HlsCacheManager {
   HlsCacheManager._();
 
   static final Map<String, _HlsDownloadState> _downloads = {};
+  static const int _maxConcurrentSegmentDownloads = 2;
+  static final _segmentSemaphore =
+      _AsyncSemaphore(_maxConcurrentSegmentDownloads);
 
   /// Get a playable path for an HLS URL.
   /// Returns a local playlist path that can be played.
@@ -206,11 +210,18 @@ class HlsCacheManager {
           }
 
           try {
-            await _downloadSegment(
-              segment.url,
-              segmentPath,
-              state.headers,
-            );
+            await _segmentSemaphore.acquire();
+            try {
+              if (state.cancelled) break;
+              await _downloadSegment(
+                state,
+                segment.url,
+                segmentPath,
+                state.headers,
+              );
+            } finally {
+              _segmentSemaphore.release();
+            }
             downloaded++;
             state.cachedSegments++;
 
@@ -221,6 +232,7 @@ class HlsCacheManager {
             );
 
             await _generateLocalPlaylist(state.originalUrl, state.playlist);
+            await CacheFileManager.evictIfNeededThrottled();
           } catch (e) {
             // Continue with next segment on error
           }
@@ -248,13 +260,15 @@ class HlsCacheManager {
 
   /// Download a single segment.
   static Future<void> _downloadSegment(
+    _HlsDownloadState state,
     String url,
     String path,
     Map<String, String>? headers,
   ) async {
     final completer = Completer<void>();
 
-    ProgressiveDownloader.download(
+    state.activeSegmentUrl = url;
+    final sub = ProgressiveDownloader.download(
       url: url,
       filePath: path,
       headers: headers,
@@ -275,8 +289,14 @@ class HlsCacheManager {
         }
       },
     );
+    state.activeSegmentSub = sub;
 
-    return completer.future;
+    try {
+      return await completer.future;
+    } finally {
+      state.activeSegmentSub = null;
+      state.activeSegmentUrl = null;
+    }
   }
 
   /// Fetch and parse a playlist from URL.
@@ -401,6 +421,7 @@ class HlsCacheManager {
       state.refreshBackoffSeconds = 0;
 
       final hlsCacheDir = await _getHlsCacheDir(state.originalUrl);
+      await _pruneLiveSegments(hlsCacheDir, refreshed);
       final initialState = await _computeInitialCacheState(
         hlsCacheDir,
         refreshed,
@@ -454,6 +475,10 @@ class HlsCacheManager {
     final state = _downloads[url];
     if (state != null) {
       state.cancelled = true;
+      state.activeSegmentSub?.cancel();
+      if (state.activeSegmentUrl != null) {
+        ProgressiveDownloader.cancel(state.activeSegmentUrl!);
+      }
       state.refreshTimer?.cancel();
       _downloads.remove(url);
     }
@@ -489,6 +514,8 @@ class _HlsDownloadState {
   Timer? refreshTimer;
   int refreshBackoffSeconds;
   bool cancelled = false;
+  String? activeSegmentUrl;
+  StreamSubscription<DownloadProgress>? activeSegmentSub;
 
   _HlsDownloadState({
     required this.originalUrl,
@@ -529,4 +556,51 @@ class _InitialCacheState {
     required this.nextIndex,
     required this.cachedSegments,
   });
+}
+
+Future<void> _pruneLiveSegments(
+  String hlsCacheDir,
+  HlsMediaPlaylist playlist,
+) async {
+  if (!playlist.isLive) return;
+  final keep = playlist.segments.map((s) => s.index).toSet();
+  final dir = Directory(hlsCacheDir);
+  if (!await dir.exists()) return;
+  final regex = RegExp(r'segment_(\d+)\.ts$');
+  await for (final entity in dir.list()) {
+    if (entity is! File) continue;
+    final match = regex.firstMatch(entity.path);
+    if (match == null) continue;
+    final idx = int.tryParse(match.group(1) ?? '');
+    if (idx == null) continue;
+    if (!keep.contains(idx)) {
+      try {
+        await entity.delete();
+      } catch (_) {}
+    }
+  }
+}
+
+class _AsyncSemaphore {
+  _AsyncSemaphore(this._available);
+  int _available;
+  final Queue<Completer<void>> _waiters = Queue<Completer<void>>();
+
+  Future<void> acquire() {
+    if (_available > 0) {
+      _available--;
+      return Future.value();
+    }
+    final completer = Completer<void>();
+    _waiters.add(completer);
+    return completer.future;
+  }
+
+  void release() {
+    if (_waiters.isNotEmpty) {
+      _waiters.removeFirst().complete();
+    } else {
+      _available++;
+    }
+  }
 }

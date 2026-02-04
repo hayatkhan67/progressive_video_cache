@@ -148,7 +148,8 @@ https://cdn.example.com/full/url/segment.ts
       final monitor = NetworkQualityMonitor.instance;
       monitor.reset();
       monitor.updateFromConnectivity(isMobile: true);
-      monitor.recordBandwidthSample(3 * 1024 * 1024, const Duration(seconds: 1));
+      monitor.recordBandwidthSample(
+          3 * 1024 * 1024, const Duration(seconds: 1));
       expect(monitor.currentType, equals(NetworkType.fiveG));
 
       monitor.reset();
@@ -165,7 +166,8 @@ https://cdn.example.com/full/url/segment.ts
 
   group('PrefetchConfig', () {
     test('forNetwork returns expected defaults', () {
-      expect(PrefetchConfig.forNetwork(NetworkType.wifi).prefetchAhead, equals(4));
+      expect(
+          PrefetchConfig.forNetwork(NetworkType.wifi).prefetchAhead, equals(4));
       expect(
         PrefetchConfig.forNetwork(NetworkType.fourG).maxConcurrent,
         equals(2),

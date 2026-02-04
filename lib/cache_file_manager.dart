@@ -12,9 +12,12 @@ class CacheFileManager {
   CacheFileManager._();
 
   static String? _cacheDir;
+  static DateTime _lastEviction = DateTime.fromMillisecondsSinceEpoch(0);
+  static bool _evictionInProgress = false;
+  static const Duration _minEvictionInterval = Duration(seconds: 30);
 
   /// Maximum cache size in bytes (default: 500MB)
-  static int maxCacheSizeBytes = 500 * 1024 * 1024;
+  static int maxCacheSizeBytes = 200 * 1024 * 1024;
 
   /// Get the cache directory, creating if needed.
   static Future<String> getCacheDir() async {
@@ -135,6 +138,20 @@ class CacheFileManager {
     }
   }
 
+  /// Throttled eviction to avoid scanning too often.
+  static Future<void> evictIfNeededThrottled() async {
+    if (_evictionInProgress) return;
+    final now = DateTime.now();
+    if (now.difference(_lastEviction) < _minEvictionInterval) return;
+    _evictionInProgress = true;
+    try {
+      await evictIfNeeded();
+    } finally {
+      _lastEviction = DateTime.now();
+      _evictionInProgress = false;
+    }
+  }
+
   /// Update access time for a file (marks it as recently used).
   /// Call this when a video is played to keep it in cache longer.
   static Future<void> updateAccessTime(String url) async {
@@ -196,7 +213,7 @@ Future<List<_CacheEntry>> _collectCacheEntries(Directory rootDir) async {
     if (entity is File) {
       try {
         final stat = await entity.stat();
-        final hash = entity.path.split('/').last.replaceAll('.mp4', '');
+        final hash = _basename(entity.path).replaceAll('.mp4', '');
         entries.add(_CacheEntry(
           size: stat.size,
           accessed: stat.accessed,
@@ -207,12 +224,12 @@ Future<List<_CacheEntry>> _collectCacheEntries(Directory rootDir) async {
       continue;
     }
 
-    if (entity is Directory && entity.path.endsWith('/hls')) {
+    if (entity is Directory && _isHlsRoot(entity)) {
       await for (final sub in entity.list()) {
         if (sub is! Directory) continue;
         final size = await _computeDirectorySize(sub);
         final accessed = await _getDirectoryAccessed(sub);
-        final hash = sub.path.split('/').last;
+        final hash = _basename(sub.path);
         entries.add(_CacheEntry(
           size: size,
           accessed: accessed,
@@ -223,6 +240,17 @@ Future<List<_CacheEntry>> _collectCacheEntries(Directory rootDir) async {
     }
   }
   return entries;
+}
+
+String _basename(String path) =>
+    path.split(Platform.pathSeparator).where((p) => p.isNotEmpty).last;
+
+bool _isHlsRoot(Directory dir) {
+  final parts = dir.path
+      .split(Platform.pathSeparator)
+      .where((p) => p.isNotEmpty)
+      .toList();
+  return parts.isNotEmpty && parts.last == 'hls';
 }
 
 Future<DateTime> _getDirectoryAccessed(Directory dir) async {

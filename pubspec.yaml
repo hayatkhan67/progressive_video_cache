@@ -1,6 +1,6 @@
 name: progressive_video_cache
 description: Progressive file-based video caching for Flutter Reels apps. Play from growing local files with instant offline playback.
-version: 1.0.0
+version: 1.1.0
 homepage: https://github.com/hayatkhan67/progressive_video_cache
 repository: https://github.com/hayatkhan67/progressive_video_cache
 issue_tracker: https://github.com/hayatkhan67/progressive_video_cache/issues

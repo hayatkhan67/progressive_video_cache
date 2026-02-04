@@ -132,6 +132,7 @@ class CacheMetadataStore {
   static Future<void> remove(String url) async {
     await _ensureLoaded();
     _cache.remove(url);
+    _lastPersisted.remove(url);
     await _persist();
   }
 
@@ -152,6 +153,7 @@ class CacheMetadataStore {
 
     for (final url in urlsToRemove) {
       _cache.remove(url);
+      _lastPersisted.remove(url);
     }
 
     if (urlsToRemove.isNotEmpty) {

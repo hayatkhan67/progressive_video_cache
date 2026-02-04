@@ -100,14 +100,24 @@ class ProgressiveDownloader {
     int startByte = 0,
     Map<String, String>? headers,
   }) {
-    final controller = StreamController<DownloadProgress>();
+    late StreamController<DownloadProgress> controller;
+    controller = StreamController<DownloadProgress>(
+      onCancel: () {
+        cancel(url);
+        if (!controller.isClosed) {
+          controller.close();
+        }
+      },
+    );
 
     _startDownload(
       url: url,
       filePath: filePath,
       startByte: startByte,
       headers: headers,
+      controller: controller,
       onProgress: (downloaded, total) {
+        if (controller.isClosed) return;
         controller.add(DownloadProgress(
           url: url,
           downloadedBytes: downloaded,
@@ -115,20 +125,22 @@ class ProgressiveDownloader {
           isComplete: total != null && downloaded >= total,
         ));
       },
-      onComplete: () {
+      onComplete: (downloaded, total) {
+        _downloads.remove(url);
+        if (controller.isClosed) return;
         controller.add(DownloadProgress(
           url: url,
-          downloadedBytes: -1,
-          totalBytes: null,
+          downloadedBytes: downloaded,
+          totalBytes: total,
           isComplete: true,
         ));
         controller.close();
-        _downloads.remove(url);
       },
       onError: (error) {
+        _downloads.remove(url);
+        if (controller.isClosed) return;
         controller.addError(error);
         controller.close();
-        _downloads.remove(url);
       },
     );
 
@@ -140,12 +152,12 @@ class ProgressiveDownloader {
     final state = _downloads[url];
     if (state != null) {
       state.cancelled = true;
-      state.subscription?.cancel();
       state.request?.abort();
-      state.sink?.close();
-      if (state.completer != null && !state.completer!.isCompleted) {
-        state.completer!.complete();
-      }
+      try {
+        if (state.controller != null && !state.controller!.isClosed) {
+          state.controller!.close();
+        }
+      } catch (_) {}
       _downloads.remove(url);
     }
   }
@@ -162,11 +174,17 @@ class ProgressiveDownloader {
     required String filePath,
     required int startByte,
     Map<String, String>? headers,
+    required StreamController<DownloadProgress> controller,
     required void Function(int downloaded, int? total) onProgress,
-    required void Function() onComplete,
+    required void Function(int downloaded, int? total) onComplete,
     required void Function(Object error) onError,
   }) async {
+    final existing = _downloads[url];
+    if (existing != null) {
+      cancel(url);
+    }
     final state = _DownloadState();
+    state.controller = controller;
     _downloads[url] = state;
 
     try {
@@ -219,56 +237,41 @@ class ProgressiveDownloader {
       final file = File(filePath);
       final mode =
           effectiveStart > 0 ? FileMode.writeOnlyAppend : FileMode.write;
-      final sink = file.openWrite(mode: mode);
-      state.sink = sink;
+      final raf = await file.open(mode: mode);
+      state.raf = raf;
 
       int downloadedBytes = effectiveStart;
       int lastReportedBytes = effectiveStart;
 
-      final done = Completer<void>();
-      state.completer = done;
-      state.subscription = response.listen(
-        (chunk) {
-          if (state.cancelled) return;
-          sink.add(chunk);
-          downloadedBytes += chunk.length;
+      await for (final chunk in response) {
+        if (state.cancelled) break;
+        await raf.writeFrom(chunk);
+        downloadedBytes += chunk.length;
 
-          // Throttle progress updates using chunkSize
-          if (downloadedBytes - lastReportedBytes >= chunkSize) {
-            onProgress(downloadedBytes, totalBytes);
-            lastReportedBytes = downloadedBytes;
-          }
-        },
-        onError: (e) {
-          if (!done.isCompleted) {
-            done.completeError(e);
-          }
-        },
-        onDone: () {
-          if (!done.isCompleted) {
-            done.complete();
-          }
-        },
-        cancelOnError: true,
-      );
-
-      await done.future;
+        // Throttle progress updates using chunkSize
+        if (downloadedBytes - lastReportedBytes >= chunkSize) {
+          onProgress(downloadedBytes, totalBytes);
+          lastReportedBytes = downloadedBytes;
+        }
+      }
 
       if (state.cancelled) {
         try {
-          await sink.close();
+          await raf.close();
         } catch (_) {}
         return;
       }
 
-      await sink.flush();
-      await sink.close();
+      await raf.flush();
+      await raf.close();
       // Don't close pooled client - let it be reused
 
       onProgress(downloadedBytes, totalBytes);
-      onComplete();
+      onComplete(downloadedBytes, totalBytes);
     } catch (e) {
-      onError(e);
+      if (!state.cancelled) {
+        onError(e);
+      }
     }
   }
 }
@@ -277,9 +280,8 @@ class _DownloadState {
   bool cancelled = false;
   HttpClientRequest? request;
   HttpClientResponse? response;
-  StreamSubscription<List<int>>? subscription;
-  IOSink? sink;
-  Completer<void>? completer;
+  RandomAccessFile? raf;
+  StreamController<DownloadProgress>? controller;
 }
 
 /// Progress update from downloader.

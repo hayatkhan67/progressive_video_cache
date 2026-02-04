@@ -109,7 +109,7 @@ class HlsParser {
             segments.add(HlsSegment(
               url: segmentUrl,
               duration: currentDuration,
-              index: segments.length,
+              index: mediaSequence + segments.length,
             ));
             break;
           }
