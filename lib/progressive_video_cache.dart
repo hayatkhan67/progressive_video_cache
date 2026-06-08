@@ -36,5 +36,6 @@ export 'cache_metadata_store.dart';
 export 'hls_cache_manager.dart';
 export 'hls_parser.dart';
 export 'network_quality_monitor.dart';
+export 'network_types.dart';
 export 'progressive_downloader.dart';
 export 'reel_prefetch_controller.dart';

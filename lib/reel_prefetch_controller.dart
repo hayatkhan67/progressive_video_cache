@@ -1,69 +1,14 @@
 import 'dart:async';
 
+import 'dart:collection';
+
 import 'cache_file_manager.dart';
 import 'cache_metadata_store.dart';
 import 'hls_cache_manager.dart';
 import 'hls_parser.dart';
+import 'network_quality_monitor.dart';
+import 'network_types.dart';
 import 'progressive_downloader.dart';
-
-/// Network quality types for adaptive prefetching
-enum NetworkType { wifi, fiveG, fourG, slow, offline }
-
-/// Configuration for adaptive prefetching based on network conditions
-class PrefetchConfig {
-  final int prefetchAhead; // Videos to prefetch ahead
-  final int prefetchBehind; // Videos to prefetch behind (for swipe-up)
-  final int keepRange; // Videos to keep in cache
-  final int maxConcurrent; // Maximum concurrent downloads
-
-  const PrefetchConfig({
-    this.prefetchAhead = 3,
-    this.prefetchBehind = 1,
-    this.keepRange = 5,
-    this.maxConcurrent = 3,
-  });
-
-  /// Adaptive config based on network type
-  factory PrefetchConfig.forNetwork(NetworkType type) {
-    switch (type) {
-      case NetworkType.wifi:
-        return const PrefetchConfig(
-          prefetchAhead: 4,
-          prefetchBehind: 2,
-          keepRange: 8,
-          maxConcurrent: 4,
-        );
-      case NetworkType.fiveG:
-        return const PrefetchConfig(
-          prefetchAhead: 3,
-          prefetchBehind: 1,
-          keepRange: 6,
-          maxConcurrent: 3,
-        );
-      case NetworkType.fourG:
-        return const PrefetchConfig(
-          prefetchAhead: 2,
-          prefetchBehind: 1,
-          keepRange: 4,
-          maxConcurrent: 2,
-        );
-      case NetworkType.slow:
-        return const PrefetchConfig(
-          prefetchAhead: 1,
-          prefetchBehind: 0,
-          keepRange: 3,
-          maxConcurrent: 1,
-        );
-      case NetworkType.offline:
-        return const PrefetchConfig(
-          prefetchAhead: 0,
-          prefetchBehind: 0,
-          keepRange: 2,
-          maxConcurrent: 0,
-        );
-    }
-  }
-}
 
 /// Controls video prefetching based on scroll position.
 /// Limits concurrent downloads and manages download lifecycle.
@@ -82,6 +27,11 @@ class ReelPrefetchController {
 
   int maxConcurrent = 3;
   final Map<String, StreamSubscription> _activeDownloads = {};
+  final Queue<_DownloadRequest> _highPriorityQueue = Queue<_DownloadRequest>();
+  final Queue<_DownloadRequest> _lowPriorityQueue = Queue<_DownloadRequest>();
+  final Set<String> _inFlight = {};
+  final Set<String> _queuedUrls = {};
+  final Set<String> _activeHls = {};
 
   /// Optional manual network type override (null = use NetworkQualityMonitor)
   NetworkType? _networkTypeOverride;
@@ -95,9 +45,8 @@ class ReelPrefetchController {
   /// Get current prefetch configuration based on network
   /// Uses NetworkQualityMonitor if no manual override is set
   PrefetchConfig get config {
-    // Import here to avoid circular dependency if needed
-    // Will use automatic network detection from NetworkQualityMonitor
-    final networkType = _networkTypeOverride ?? NetworkType.wifi;
+    final networkType = _networkTypeOverride ??
+        NetworkQualityMonitor.instance.currentType;
     return PrefetchConfig.forNetwork(networkType);
   }
 
@@ -128,8 +77,14 @@ class ReelPrefetchController {
         prefetchSegments: 3,
         headers: headers,
       );
+      if (result.isFullyCached) {
+        _activeHls.remove(url);
+      } else {
+        _activeHls.add(url);
+      }
       return result.playlistPath;
     } catch (e) {
+      _activeHls.remove(url);
       // Fallback to original URL on error
       return url;
     }
@@ -145,6 +100,7 @@ class ReelPrefetchController {
     // If already complete, return immediately
     final isComplete = await CacheMetadataStore.isComplete(url);
     if (isComplete) {
+      await CacheFileManager.updateAccessTime(url);
       return path;
     }
 
@@ -155,6 +111,7 @@ class ReelPrefetchController {
     if (fileSize >= minBytes) {
       // Enough bytes exist, resume download in background
       _startDownload(url, path, headers);
+      await CacheFileManager.updateAccessTime(url);
       return path;
     }
 
@@ -162,17 +119,30 @@ class ReelPrefetchController {
     // Already downloading?
     if (_activeDownloads.containsKey(url)) {
       // Wait for existing download to reach threshold
-      return await _waitForMinBytes(url, path, minBytes);
+      final result = await _waitForMinBytes(url, path, minBytes);
+      await CacheFileManager.updateAccessTime(url);
+      return result;
     }
 
     // At concurrency limit?
-    if (_activeDownloads.length >= maxConcurrent) {
+    if (_inFlight.length >= _currentMaxConcurrent) {
       // Can't start new download, return path anyway (fallback to network)
+      _enqueueDownload(
+        _DownloadRequest(
+          url: url,
+          path: path,
+          headers: headers,
+          priority: _DownloadPriority.high,
+        ),
+      );
+      await CacheFileManager.updateAccessTime(url);
       return path;
     }
 
     // Start download and wait for minimum bytes
-    return await _downloadAndWaitForMin(url, path, headers);
+    final result = await _downloadAndWaitForMin(url, path, headers);
+    await CacheFileManager.updateAccessTime(url);
+    return result;
   }
 
   /// Check if video is fully cached.
@@ -195,13 +165,14 @@ class ReelPrefetchController {
     String path,
     Map<String, String>? headers,
   ) {
-    // Already downloading
-    if (_activeDownloads.containsKey(url)) return;
-
-    // At concurrency limit
-    if (_activeDownloads.length >= maxConcurrent) return;
-
-    _startDownloadInternal(url, path, headers);
+    _enqueueDownload(
+      _DownloadRequest(
+        url: url,
+        path: path,
+        headers: headers,
+        priority: _DownloadPriority.low,
+      ),
+    );
   }
 
   Future<void> _startDownloadInternal(
@@ -228,14 +199,14 @@ class ReelPrefetchController {
         );
 
         if (progress.isComplete) {
-          _activeDownloads.remove(url);
+          _finishDownload(url);
         }
       },
       onError: (e) {
-        _activeDownloads.remove(url);
+        _finishDownload(url);
       },
       onDone: () {
-        _activeDownloads.remove(url);
+        _finishDownload(url);
       },
     );
   }
@@ -249,6 +220,19 @@ class ReelPrefetchController {
     final startByte = await CacheFileManager.getFileSize(url);
 
     try {
+      if (!_tryReserveSlot(url)) {
+        // No slot available, return path and enqueue background download
+        _enqueueDownload(
+          _DownloadRequest(
+            url: url,
+            path: path,
+            headers: headers,
+            priority: _DownloadPriority.high,
+          ),
+        );
+        return path;
+      }
+
       final result = await ProgressiveDownloader.downloadAndWaitForBytes(
         url: url,
         filePath: path,
@@ -268,13 +252,22 @@ class ReelPrefetchController {
             totalBytes: progress.totalBytes,
           );
           if (progress.isComplete) {
-            _activeDownloads.remove(url);
+            _finishDownload(url);
           }
         });
+        result.subscription!.onDone(() {
+          _finishDownload(url);
+        });
+        result.subscription!.onError((_) {
+          _finishDownload(url);
+        });
+      } else {
+        _finishDownload(url);
       }
 
       return path;
     } catch (e) {
+      _finishDownload(url);
       // Download failed, return path anyway (will trigger network fallback)
       return path;
     }
@@ -308,17 +301,91 @@ class ReelPrefetchController {
     return path;
   }
 
+  int get _currentMaxConcurrent {
+    final configMax = config.maxConcurrent;
+    return maxConcurrent < configMax ? maxConcurrent : configMax;
+  }
+
+  bool _tryReserveSlot(String url) {
+    if (_inFlight.contains(url)) return false;
+    if (_inFlight.length >= _currentMaxConcurrent) return false;
+    _inFlight.add(url);
+    return true;
+  }
+
+  void _finishDownload(String url) {
+    _activeDownloads.remove(url);
+    if (_inFlight.remove(url)) {
+      _processQueue();
+    }
+    unawaited(CacheFileManager.evictIfNeededThrottled());
+  }
+
+  void _enqueueDownload(_DownloadRequest request) {
+    if (_activeDownloads.containsKey(request.url) ||
+        _inFlight.contains(request.url) ||
+        _queuedUrls.contains(request.url)) {
+      return;
+    }
+
+    if (_tryReserveSlot(request.url)) {
+      _startDownloadInternal(request.url, request.path, request.headers);
+      return;
+    }
+
+    _queuedUrls.add(request.url);
+    if (request.priority == _DownloadPriority.high) {
+      _highPriorityQueue.add(request);
+    } else {
+      _lowPriorityQueue.add(request);
+    }
+  }
+
+  void _processQueue() {
+    while (_inFlight.length < _currentMaxConcurrent) {
+      _DownloadRequest? next;
+      if (_highPriorityQueue.isNotEmpty) {
+        next = _highPriorityQueue.removeFirst();
+      } else if (_lowPriorityQueue.isNotEmpty) {
+        next = _lowPriorityQueue.removeFirst();
+      } else {
+        return;
+      }
+
+      _queuedUrls.remove(next.url);
+      if (_tryReserveSlot(next.url)) {
+        _startDownloadInternal(next.url, next.path, next.headers);
+      }
+    }
+  }
+
+  void _removeQueued(String url) {
+    if (_queuedUrls.remove(url)) {
+      _highPriorityQueue.removeWhere((r) => r.url == url);
+      _lowPriorityQueue.removeWhere((r) => r.url == url);
+    }
+  }
+
+  void _clearQueue() {
+    _queuedUrls.clear();
+    _highPriorityQueue.clear();
+    _lowPriorityQueue.clear();
+  }
+
   /// Cancel download for a URL.
   void cancelDownload(String url) {
     // Cancel MP4 download
     _activeDownloads[url]?.cancel();
     _activeDownloads.remove(url);
+    _inFlight.remove(url);
+    _removeQueued(url);
     ProgressiveDownloader.cancel(url);
 
     // Cancel HLS download
     if (HlsParser.isHlsUrl(url)) {
       HlsCacheManager.cancel(url);
     }
+    _activeHls.remove(url);
   }
 
   /// Cancel all downloads.
@@ -327,8 +394,11 @@ class ReelPrefetchController {
       sub.cancel();
     }
     _activeDownloads.clear();
+    _inFlight.clear();
+    _clearQueue();
     ProgressiveDownloader.cancelAll();
     HlsCacheManager.cancelAll();
+    _activeHls.clear();
   }
 
   /// Update prefetch based on current scroll position.
@@ -362,6 +432,21 @@ class ReelPrefetchController {
       cancelDownload(url);
     }
 
+    // Cancel HLS downloads outside keep range
+    final keepUrls = <String>{};
+    for (int i = currentIndex - effectiveKeepRange;
+        i <= currentIndex + effectiveKeepRange;
+        i++) {
+      if (i >= 0 && i < urls.length) {
+        keepUrls.add(urls[i]);
+      }
+    }
+    for (final url in _activeHls.toList()) {
+      if (!keepUrls.contains(url)) {
+        cancelDownload(url);
+      }
+    }
+
     // Priority-based prefetch: next video first, then previous, then further ahead
     final prefetchQueue = <int>[];
 
@@ -391,4 +476,20 @@ class ReelPrefetchController {
   void dispose() {
     cancelAll();
   }
+}
+
+enum _DownloadPriority { high, low }
+
+class _DownloadRequest {
+  final String url;
+  final String path;
+  final Map<String, String>? headers;
+  final _DownloadPriority priority;
+
+  _DownloadRequest({
+    required this.url,
+    required this.path,
+    required this.headers,
+    required this.priority,
+  });
 }

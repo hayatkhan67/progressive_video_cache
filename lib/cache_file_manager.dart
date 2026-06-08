@@ -12,9 +12,12 @@ class CacheFileManager {
   CacheFileManager._();
 
   static String? _cacheDir;
+  static DateTime _lastEviction = DateTime.fromMillisecondsSinceEpoch(0);
+  static bool _evictionInProgress = false;
+  static const Duration _minEvictionInterval = Duration(seconds: 30);
 
   /// Maximum cache size in bytes (default: 500MB)
-  static int maxCacheSizeBytes = 500 * 1024 * 1024;
+  static int maxCacheSizeBytes = 200 * 1024 * 1024;
 
   /// Get the cache directory, creating if needed.
   static Future<String> getCacheDir() async {
@@ -89,13 +92,7 @@ class CacheFileManager {
     final dir = Directory(await getCacheDir());
     if (!dir.existsSync()) return 0;
 
-    int total = 0;
-    await for (final entity in dir.list()) {
-      if (entity is File) {
-        total += entity.lengthSync();
-      }
-    }
-    return total;
+    return _computeDirectorySize(dir);
   }
 
   /// Evict oldest files if cache exceeds maximum size.
@@ -105,50 +102,53 @@ class CacheFileManager {
     final dir = Directory(await getCacheDir());
     if (!dir.existsSync()) return;
 
-    // Collect all files with their stats
-    final files = <File>[];
-    await for (final entity in dir.list()) {
-      if (entity is File) {
-        files.add(entity);
-      }
-    }
+    // Collect cache entries (mp4 files + HLS directories)
+    final entries = await _collectCacheEntries(dir);
 
     // Calculate total size
     int totalSize = 0;
-    final fileStats = <(File, FileStat)>[];
-
-    for (final file in files) {
-      try {
-        final stat = await file.stat();
-        totalSize += stat.size;
-        fileStats.add((file, stat));
-      } catch (_) {
-        // Skip files that can't be stat'd
-      }
+    for (final entry in entries) {
+      totalSize += entry.size;
     }
 
     // Check if eviction needed
     if (totalSize <= maxCacheSizeBytes) return;
 
     // Sort by last accessed time (oldest first)
-    fileStats.sort((a, b) => a.$2.accessed.compareTo(b.$2.accessed));
+    entries.sort((a, b) => a.accessed.compareTo(b.accessed));
 
     // Target 80% of max to avoid frequent evictions
     final targetSize = (maxCacheSizeBytes * 0.8).toInt();
 
-    for (final (file, stat) in fileStats) {
+    for (final entry in entries) {
       if (totalSize <= targetSize) break;
 
       try {
-        totalSize -= stat.size;
-        await file.delete();
+        totalSize -= entry.size;
+        if (entry.isDirectory) {
+          await entry.directory!.delete(recursive: true);
+        } else {
+          await entry.file!.delete();
+        }
 
-        // Extract hash from filename (format: hash.mp4)
-        final hash = file.path.split('/').last.replaceAll('.mp4', '');
-        await CacheMetadataStore.removeByHash(hash);
+        await CacheMetadataStore.removeByHash(entry.hash);
       } catch (_) {
         // Ignore deletion failures
       }
+    }
+  }
+
+  /// Throttled eviction to avoid scanning too often.
+  static Future<void> evictIfNeededThrottled() async {
+    if (_evictionInProgress) return;
+    final now = DateTime.now();
+    if (now.difference(_lastEviction) < _minEvictionInterval) return;
+    _evictionInProgress = true;
+    try {
+      await evictIfNeeded();
+    } finally {
+      _lastEviction = DateTime.now();
+      _evictionInProgress = false;
     }
   }
 
@@ -174,5 +174,102 @@ class CacheFileManager {
   /// Get MD5 hash of URL. Public for use by HLS cache.
   static String getUrlHash(String url) {
     return md5.convert(utf8.encode(url)).toString();
+  }
+}
+
+class _CacheEntry {
+  final int size;
+  final DateTime accessed;
+  final String hash;
+  final File? file;
+  final Directory? directory;
+
+  _CacheEntry({
+    required this.size,
+    required this.accessed,
+    required this.hash,
+    this.file,
+    this.directory,
+  });
+
+  bool get isDirectory => directory != null;
+}
+
+Future<int> _computeDirectorySize(Directory dir) async {
+  int total = 0;
+  await for (final entity in dir.list(recursive: true)) {
+    if (entity is File) {
+      try {
+        total += entity.lengthSync();
+      } catch (_) {}
+    }
+  }
+  return total;
+}
+
+Future<List<_CacheEntry>> _collectCacheEntries(Directory rootDir) async {
+  final entries = <_CacheEntry>[];
+  await for (final entity in rootDir.list()) {
+    if (entity is File) {
+      try {
+        final stat = await entity.stat();
+        final hash = _basename(entity.path).replaceAll('.mp4', '');
+        entries.add(_CacheEntry(
+          size: stat.size,
+          accessed: stat.accessed,
+          hash: hash,
+          file: entity,
+        ));
+      } catch (_) {}
+      continue;
+    }
+
+    if (entity is Directory && _isHlsRoot(entity)) {
+      await for (final sub in entity.list()) {
+        if (sub is! Directory) continue;
+        final size = await _computeDirectorySize(sub);
+        final accessed = await _getDirectoryAccessed(sub);
+        final hash = _basename(sub.path);
+        entries.add(_CacheEntry(
+          size: size,
+          accessed: accessed,
+          hash: hash,
+          directory: sub,
+        ));
+      }
+    }
+  }
+  return entries;
+}
+
+String _basename(String path) =>
+    path.split(Platform.pathSeparator).where((p) => p.isNotEmpty).last;
+
+bool _isHlsRoot(Directory dir) {
+  final parts = dir.path
+      .split(Platform.pathSeparator)
+      .where((p) => p.isNotEmpty)
+      .toList();
+  return parts.isNotEmpty && parts.last == 'hls';
+}
+
+Future<DateTime> _getDirectoryAccessed(Directory dir) async {
+  DateTime? latest;
+  await for (final entity in dir.list(recursive: true)) {
+    if (entity is File) {
+      try {
+        final stat = await entity.stat();
+        final accessed = stat.accessed;
+        if (latest == null || accessed.isAfter(latest)) {
+          latest = accessed;
+        }
+      } catch (_) {}
+    }
+  }
+  if (latest != null) return latest;
+  try {
+    return (await dir.stat()).accessed;
+  } catch (_) {
+    return DateTime.fromMillisecondsSinceEpoch(0);
   }
 }
