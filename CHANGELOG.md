@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.1
+## 1.1.0
 
 ### Added
 - `network_types.dart` for shared `NetworkType` and `PrefetchConfig`
@@ -17,6 +17,7 @@
 - Cancellation now aborts network streams to reduce wasted bandwidth
 - HLS segment downloader no longer loops indefinitely after completion
 - MP4 metadata reconciles with on-disk file sizes at startup
+- Unused parameter warnings in private HLS download state constructors
 
 ## 1.0.0
 

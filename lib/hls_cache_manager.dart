@@ -510,9 +510,9 @@ class _HlsDownloadState {
   final Map<String, String>? headers;
   int nextIndex;
   int cachedSegments;
-  bool isDownloading;
+  bool isDownloading = false;
   Timer? refreshTimer;
-  int refreshBackoffSeconds;
+  int refreshBackoffSeconds = 0;
   bool cancelled = false;
   String? activeSegmentUrl;
   StreamSubscription<DownloadProgress>? activeSegmentSub;
@@ -523,8 +523,6 @@ class _HlsDownloadState {
     this.headers,
     this.nextIndex = 0,
     this.cachedSegments = 0,
-    this.isDownloading = false,
-    this.refreshBackoffSeconds = 0,
   });
 }
 
