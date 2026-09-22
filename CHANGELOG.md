@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.1
+
+### Fixed
+- Cache size accounting discrepancy during failed evictions
+- HLS Cache Manager to use `utf8.decoder` instead of locale-dependent `SystemEncoding`
+- File handle leaks by closing and nulling the RAF reference on download cancellation and errors
+- Cached HLS playlist return validation: verify that local segment files exist on disk before returning path
+- Analyzer warnings regarding unused parameters in HLS download state constructor
+
 ## 1.1.0
 
 ### Added

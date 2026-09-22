@@ -16,7 +16,7 @@ class CacheFileManager {
   static bool _evictionInProgress = false;
   static const Duration _minEvictionInterval = Duration(seconds: 30);
 
-  /// Maximum cache size in bytes (default: 500MB)
+  /// Maximum cache size in bytes (default: 200MB)
   static int maxCacheSizeBytes = 200 * 1024 * 1024;
 
   /// Get the cache directory, creating if needed.
@@ -124,16 +124,15 @@ class CacheFileManager {
       if (totalSize <= targetSize) break;
 
       try {
-        totalSize -= entry.size;
         if (entry.isDirectory) {
           await entry.directory!.delete(recursive: true);
         } else {
           await entry.file!.delete();
         }
-
+        totalSize -= entry.size;
         await CacheMetadataStore.removeByHash(entry.hash);
       } catch (_) {
-        // Ignore deletion failures
+        // Ignore deletion failures and keep file in totalSize
       }
     }
   }

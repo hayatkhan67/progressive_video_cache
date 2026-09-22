@@ -154,6 +154,10 @@ class ProgressiveDownloader {
       state.cancelled = true;
       state.request?.abort();
       try {
+        state.raf?.close();
+      } catch (_) {}
+      state.raf = null;
+      try {
         if (state.controller != null && !state.controller!.isClosed) {
           state.controller!.close();
         }
@@ -168,6 +172,7 @@ class ProgressiveDownloader {
       cancel(url);
     }
   }
+
 
   static Future<void> _startDownload({
     required String url,
@@ -259,16 +264,22 @@ class ProgressiveDownloader {
         try {
           await raf.close();
         } catch (_) {}
+        state.raf = null;
         return;
       }
 
       await raf.flush();
       await raf.close();
+      state.raf = null;
       // Don't close pooled client - let it be reused
 
       onProgress(downloadedBytes, totalBytes);
       onComplete(downloadedBytes, totalBytes);
     } catch (e) {
+      try {
+        await state.raf?.close();
+      } catch (_) {}
+      state.raf = null;
       if (!state.cancelled) {
         onError(e);
       }

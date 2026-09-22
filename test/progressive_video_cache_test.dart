@@ -177,5 +177,228 @@ https://cdn.example.com/full/url/segment.ts
         equals(0),
       );
     });
+
+    test('all network types return correct values', () {
+      for (final type in NetworkType.values) {
+        final config = PrefetchConfig.forNetwork(type);
+        expect(config.maxConcurrent, isNonNegative);
+        expect(config.prefetchAhead, isNonNegative);
+        expect(config.prefetchBehind, isNonNegative);
+        expect(config.keepRange, isNonNegative);
+      }
+    });
+  });
+
+  group('HlsParser Additional Tests', () {
+    test('master playlist with codecs', () {
+      const content = '''
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1280000,RESOLUTION=720x480,CODECS="avc1.4d401f,mp4a.40.2"
+720p.m3u8
+''';
+      final playlist = HlsParser.parse(content, 'https://example.com/master.m3u8') as HlsMasterPlaylist;
+      expect(playlist.variants.length, equals(1));
+      expect(playlist.variants[0].codecs, equals('avc1.4d401f,mp4a.40.2'));
+    });
+
+    test('live playlist has no EXT-X-ENDLIST', () {
+      const content = '''
+#EXTM3U
+#EXT-X-TARGETDURATION:10
+#EXTINF:10,
+segment0.ts
+''';
+      final playlist = HlsParser.parse(content, 'https://example.com/playlist.m3u8') as HlsMediaPlaylist;
+      expect(playlist.isLive, isTrue);
+    });
+
+    test('empty playlist content throws FormatException', () {
+      expect(() => HlsParser.parse('', 'https://example.com/empty.m3u8'), throwsFormatException);
+    });
+
+    test('resolves relative URLs with ports correctly', () {
+      const content = '''
+#EXTM3U
+#EXTINF:10,
+/absolute/path/segment.ts
+''';
+      final playlist = HlsParser.parse(content, 'http://example.com:8080/video/playlist.m3u8') as HlsMediaPlaylist;
+      expect(playlist.segments[0].url, equals('http://example.com:8080/absolute/path/segment.ts'));
+    });
+  });
+
+  group('CacheMetadata Tests', () {
+    test('JSON round-trip serialization', () {
+      final now = DateTime.now();
+      final original = CacheMetadata(
+        downloadedBytes: 500,
+        totalBytes: 1000,
+        isComplete: false,
+        lastUpdated: now,
+        isHls: true,
+      );
+
+      final json = original.toJson();
+      final restored = CacheMetadata.fromJson(json);
+
+      expect(restored.downloadedBytes, equals(500));
+      expect(restored.totalBytes, equals(1000));
+      expect(restored.isComplete, isFalse);
+      expect(restored.lastUpdated.toIso8601String(), equals(now.toIso8601String()));
+      expect(restored.isHls, isTrue);
+    });
+
+    test('fromJson with missing optional fields', () {
+      final json = {
+        'downloadedBytes': 300,
+        'isComplete': true,
+        'lastUpdated': DateTime.now().toIso8601String(),
+      };
+      final metadata = CacheMetadata.fromJson(json);
+      expect(metadata.totalBytes, isNull);
+      expect(metadata.isHls, isFalse);
+    });
+  });
+
+  group('NetworkQualityMonitor Additional Tests', () {
+    test('bandwidth sample does not update WiFi type', () {
+      final monitor = NetworkQualityMonitor.instance;
+      monitor.reset();
+      monitor.updateFromConnectivity(isWifi: true);
+      monitor.recordBandwidthSample(100, const Duration(milliseconds: 200));
+      // Should remain WiFi despite the low bandwidth sample
+      expect(monitor.currentType, equals(NetworkType.wifi));
+    });
+
+    test('reset() restores defaults', () {
+      final monitor = NetworkQualityMonitor.instance;
+      monitor.updateFromConnectivity(isWifi: null, isMobile: null); // offline
+      monitor.reset();
+      expect(monitor.currentType, equals(NetworkType.wifi));
+    });
+
+    test('short sample (<100ms) is ignored', () {
+      final monitor = NetworkQualityMonitor.instance;
+      monitor.reset();
+      monitor.updateFromConnectivity(isMobile: true);
+      monitor.recordBandwidthSample(5000000, const Duration(milliseconds: 50));
+      // High bandwidth but duration is < 100ms, so ignored and stays fourG (default mobile)
+      expect(monitor.currentType, equals(NetworkType.fourG));
+    });
+  });
+
+  group('DownloadProgress Tests', () {
+    test('progress calculation normal case', () {
+      final progress = DownloadProgress(
+        url: 'https://example.com/video.mp4',
+        downloadedBytes: 250,
+        totalBytes: 1000,
+        isComplete: false,
+      );
+      expect(progress.progress, equals(0.25));
+    });
+
+    test('progress calculation with 0 total', () {
+      final progress = DownloadProgress(
+        url: 'https://example.com/video.mp4',
+        downloadedBytes: 250,
+        totalBytes: 0,
+        isComplete: false,
+      );
+      expect(progress.progress, equals(0.0));
+    });
+
+    test('progress calculation with null total', () {
+      final progress = DownloadProgress(
+        url: 'https://example.com/video.mp4',
+        downloadedBytes: 250,
+        totalBytes: null,
+        isComplete: false,
+      );
+      expect(progress.progress, equals(0.0));
+    });
+  });
+
+  group('HlsCacheResult Tests', () {
+    test('progress calculation normal case', () {
+      final result = HlsCacheResult(
+        playlistPath: 'path/to/playlist.m3u8',
+        isFullyCached: false,
+        totalSegments: 10,
+        cachedSegments: 4,
+      );
+      expect(result.progress, equals(0.4));
+    });
+
+    test('progress calculation edge cases', () {
+      final result1 = HlsCacheResult(
+        playlistPath: 'path/to/playlist.m3u8',
+        isFullyCached: false,
+        totalSegments: 0,
+        cachedSegments: 0,
+      );
+      expect(result1.progress, equals(0.0));
+
+      final result2 = HlsCacheResult(
+        playlistPath: 'path/to/playlist.m3u8',
+        isFullyCached: false,
+        totalSegments: null,
+        cachedSegments: 4,
+      );
+      expect(result2.progress, equals(0.0));
+    });
+  });
+
+  group('HlsVariant and HlsSegment Tests', () {
+    test('construction and field access', () {
+      final variant = HlsVariant(
+        url: 'https://example.com/v.m3u8',
+        bandwidth: 800000,
+        resolution: '640x360',
+        codecs: 'mp4a.40.2',
+      );
+      expect(variant.url, equals('https://example.com/v.m3u8'));
+      expect(variant.bandwidth, equals(800000));
+      expect(variant.resolution, equals('640x360'));
+      expect(variant.codecs, equals('mp4a.40.2'));
+
+      final segment = HlsSegment(
+        url: 'https://example.com/s1.ts',
+        duration: 9.5,
+        index: 2,
+      );
+      expect(segment.url, equals('https://example.com/s1.ts'));
+      expect(segment.duration, equals(9.5));
+      expect(segment.index, equals(2));
+    });
+  });
+
+  group('HlsMasterPlaylist Tests', () {
+    test('getVariantByBandwidth closest match and empty variants', () {
+      final v1 = HlsVariant(url: 'v1.m3u8', bandwidth: 500000);
+      final v2 = HlsVariant(url: 'v2.m3u8', bandwidth: 1500000);
+      final master = HlsMasterPlaylist(url: 'master.m3u8', variants: [v1, v2]);
+
+      expect(master.getVariantByBandwidth(900000), equals(v1));
+      expect(master.getVariantByBandwidth(1100000), equals(v2));
+
+      final emptyMaster = HlsMasterPlaylist(url: 'master.m3u8', variants: []);
+      expect(emptyMaster.getVariantByBandwidth(1000000), isNull);
+    });
+  });
+
+  group('HlsMediaPlaylist Tests', () {
+    test('totalDuration calculation', () {
+      final s1 = HlsSegment(url: 's1.ts', duration: 10.0, index: 0);
+      final s2 = HlsSegment(url: 's2.ts', duration: 8.5, index: 1);
+      final playlist = HlsMediaPlaylist(
+        url: 'playlist.m3u8',
+        segments: [s1, s2],
+        targetDuration: 10.0,
+        mediaSequence: 0,
+        isLive: false,
+      );
+      expect(playlist.totalDuration, equals(18.5));
+    });
   });
 }

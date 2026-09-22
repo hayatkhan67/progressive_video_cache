@@ -1,8 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
+
+import 'cache_file_manager.dart';
 
 /// Tracks download progress and completion status.
 /// Persists metadata to survive app restarts.
@@ -169,8 +170,7 @@ class CacheMetadataStore {
 
   /// MD5 hash of URL (same algorithm as CacheFileManager).
   static String _urlToHash(String url) {
-    // Using crypto package for proper MD5 hashing
-    return md5.convert(utf8.encode(url)).toString();
+    return CacheFileManager.getUrlHash(url);
   }
 
   /// Clear all metadata.

@@ -155,9 +155,9 @@ class HlsParser {
       return url;
     }
     if (url.startsWith('/')) {
-      // Absolute path - need to get scheme and host from base
+      // Absolute path - need to get scheme and host/port from base
       final uri = Uri.parse(baseUrl);
-      return '${uri.scheme}://${uri.host}$url';
+      return '${uri.scheme}://${uri.authority}$url';
     }
     return baseUrl + url;
   }

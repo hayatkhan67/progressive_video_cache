@@ -16,6 +16,10 @@ import 'progressive_downloader.dart';
 class ReelPrefetchController {
   static final ReelPrefetchController _instance =
       ReelPrefetchController._internal();
+  /// Factory constructor returning the singleton instance.
+  /// 
+  /// WARNING: Passing [maxConcurrent] mutates the configuration of the active
+  /// singleton instance globally, affecting all references.
   factory ReelPrefetchController({int? maxConcurrent}) {
     if (maxConcurrent != null) {
       _instance.maxConcurrent = maxConcurrent;
@@ -468,7 +472,7 @@ class ReelPrefetchController {
 
     // Start prefetch for queued videos
     for (final idx in prefetchQueue) {
-      getPlayablePath(urls[idx], headers: headers);
+      unawaited(getPlayablePath(urls[idx], headers: headers));
     }
   }
 

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:io';
 
 import 'cache_file_manager.dart';
@@ -29,11 +30,17 @@ class HlsCacheManager {
     // Check if we have a cached playlist
     final cachedPlaylist = await _getCachedPlaylist(hlsUrl);
     if (cachedPlaylist != null) {
-      // Return cached playlist with local paths
-      return HlsCacheResult(
-        playlistPath: cachedPlaylist,
-        isFullyCached: await _isFullyCached(hlsUrl),
-      );
+      // Validate that the cached segments actually exist and are not evicted/missing
+      final isStillValid = await _validateCachedSegments(hlsUrl);
+      if (isStillValid) {
+        return HlsCacheResult(
+          playlistPath: cachedPlaylist,
+          isFullyCached: await _isFullyCached(hlsUrl),
+        );
+      } else {
+        // Cached segments are missing. Clean up stale local playlist so we can re-fetch.
+        await clearCache(hlsUrl);
+      }
     }
 
     // Fetch and parse the playlist
@@ -318,7 +325,7 @@ class HlsCacheManager {
         throw HttpException('HTTP ${response.statusCode}');
       }
 
-      final content = await response.transform(SystemEncoding().decoder).join();
+      final content = await response.transform(utf8.decoder).join();
       return HlsParser.parse(content, url);
     } finally {
       client.close();
@@ -491,6 +498,25 @@ class HlsCacheManager {
     }
   }
 
+  /// Validate that the HLS cached segments exist on disk.
+  static Future<bool> _validateCachedSegments(String url) async {
+    final metadata = await CacheMetadataStore.get(url);
+    if (metadata == null) return false;
+    final hlsCacheDir = await _getHlsCacheDir(url);
+    final total = metadata.totalBytes ?? 0;
+    if (total == 0) return false;
+    
+    // Check if the actual segment files exist for the cached segments
+    for (int i = 0; i < total; i++) {
+      final segmentPath = _getSegmentPath(hlsCacheDir, i);
+      final file = File(segmentPath);
+      if (!file.existsSync() || file.lengthSync() == 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /// Clear HLS cache for a URL.
   static Future<void> clearCache(String url) async {
     cancel(url);
@@ -523,7 +549,9 @@ class _HlsDownloadState {
     this.headers,
     this.nextIndex = 0,
     this.cachedSegments = 0,
-  });
+  }) : isDownloading = false,
+       refreshBackoffSeconds = 0;
+
 }
 
 /// Result of getting playable HLS path.
